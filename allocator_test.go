@@ -10,10 +10,11 @@ import (
 func TestAllocate(t *testing.T) {
 	testcases := map[string]*struct {
 		allocator *Allocator
+		reserved  []netip.Prefix
 		expPrefix netip.Prefix
 		expErr    error
 	}{
-		"Last partial overlap": {
+		"Partial overlap at the end of allocated, enough space": {
 			allocator: &Allocator{
 				pools: []Pool{
 					{Prefix: netip.MustParsePrefix("192.168.0.0/16"), Size: 24},
@@ -27,7 +28,40 @@ func TestAllocate(t *testing.T) {
 			},
 			expPrefix: netip.MustParsePrefix("192.168.3.0/24"),
 		},
-		"Partial overlap in the middle with enough space left": {
+		"Partial overlap at the end of allocated and reserved, enough space": {
+			allocator: &Allocator{
+				pools: []Pool{
+					{Prefix: netip.MustParsePrefix("192.168.0.0/16"), Size: 24},
+				},
+				allocated: []netip.Prefix{
+					// Partial overlap with enough space remaining
+					netip.MustParsePrefix("192.168.0.0/24"),
+					netip.MustParsePrefix("192.168.1.0/24"),
+					netip.MustParsePrefix("192.168.2.3/30"),
+				},
+			},
+			reserved: []netip.Prefix{
+				netip.MustParsePrefix("192.168.2.4/30"),
+				netip.MustParsePrefix("192.168.3.0/30"),
+			},
+			expPrefix: netip.MustParsePrefix("192.168.4.0/24"),
+		},
+		"Partial overlap, same prefix, enough space": {
+			allocator: &Allocator{
+				pools: []Pool{
+					{Prefix: netip.MustParsePrefix("192.168.0.0/16"), Size: 24},
+				},
+				allocated: []netip.Prefix{
+					// Partial overlap with enough space remaining
+					netip.MustParsePrefix("192.168.0.0/24"),
+				},
+			},
+			reserved: []netip.Prefix{
+				netip.MustParsePrefix("192.168.0.0/24"),
+			},
+			expPrefix: netip.MustParsePrefix("192.168.1.0/24"),
+		},
+		"Partial overlap in the middle, enough space": {
 			allocator: &Allocator{
 				pools: []Pool{
 					{Prefix: netip.MustParsePrefix("172.16.0.0/15"), Size: 16},
@@ -41,7 +75,7 @@ func TestAllocate(t *testing.T) {
 			},
 			expPrefix: netip.MustParsePrefix("172.17.0.0/16"),
 		},
-		"Partial overlap in the middle but with not enough space left": {
+		"Partial overlap in the middle, not enough space left": {
 			allocator: &Allocator{
 				pools: []Pool{
 					{Prefix: netip.MustParsePrefix("172.16.0.0/15"), Size: 16},
@@ -56,7 +90,7 @@ func TestAllocate(t *testing.T) {
 			},
 			expPrefix: netip.MustParsePrefix("192.168.1.0/24"),
 		},
-		"Partial overlap but not enough space left": {
+		"Partial overlap at the start, enough space left in the middle": {
 			allocator: &Allocator{
 				pools: []Pool{
 					{Prefix: netip.MustParsePrefix("30.0.0.0/31"), Size: 31},
@@ -65,11 +99,12 @@ func TestAllocate(t *testing.T) {
 				allocated: []netip.Prefix{
 					// Partial overlap but not enough space left
 					netip.MustParsePrefix("30.0.0.0/32"),
+					netip.MustParsePrefix("200.0.0.0/8"),
 				},
 			},
 			expPrefix: netip.MustParsePrefix("192.168.0.0/24"),
 		},
-		"Full overlap with small allocations": {
+		"Full overlap with small allocations, enough space": {
 			allocator: &Allocator{
 				pools: []Pool{
 					{Prefix: netip.MustParsePrefix("40.0.0.0/31"), Size: 31},
@@ -152,12 +187,25 @@ func TestAllocate(t *testing.T) {
 			},
 			expErr: ErrNoFreePool,
 		},
+		"Minimal overlap at the start, enough space": {
+			allocator: &Allocator{
+				pools: []Pool{
+					{Prefix: netip.MustParsePrefix("172.16.0.0/15"), Size: 16},
+					{Prefix: netip.MustParsePrefix("192.168.0.0/16"), Size: 24},
+				},
+				allocated: []netip.Prefix{
+					netip.MustParsePrefix("172.16.0.0/16"),
+					netip.MustParsePrefix("192.168.1.1/31"),
+				},
+			},
+			expPrefix: netip.MustParsePrefix("172.17.0.0/16"),
+		},
 	}
 
 	for tcname := range testcases {
 		tc := testcases[tcname]
 		t.Run(tcname, func(t *testing.T) {
-			p, err := tc.allocator.AllocateNext()
+			p, err := tc.allocator.AllocateNext(tc.reserved)
 
 			assert.ErrorIs(t, err, tc.expErr)
 			assert.Equal(t, p, tc.expPrefix)
@@ -228,7 +276,7 @@ func BenchmarkAllocate(b *testing.B) {
 		},
 	}
 
-	p, err := a.AllocateNext()
+	p, err := a.AllocateNext([]netip.Prefix{})
 
 	assert.NilError(b, err)
 	assert.Equal(b, p, netip.MustParsePrefix("192.168.3.0/24"))
@@ -244,7 +292,7 @@ func BenchmarkEmpty(b *testing.B) {
 		allocated: []netip.Prefix{},
 	}
 
-	p, err := a.AllocateNext()
+	p, err := a.AllocateNext([]netip.Prefix{})
 
 	assert.NilError(b, err)
 	assert.Equal(b, p, netip.MustParsePrefix("30.0.0.0/31"))
@@ -265,13 +313,40 @@ func BenchmarkSerial(b *testing.B) {
 	//    100 -> 200us
 	//     10 -> 14us
 	//      1 -> 10us
-	imax := 1000
+	imax := 10000
 	for i := 0; i < imax; i++ {
-		_, err := a.AllocateNext()
+		_, err := a.AllocateNext([]netip.Prefix{})
 		if err != nil {
 			panic(err)
 		}
 	}
 
 	assert.Equal(b, len(a.allocated), imax)
+}
+
+func BenchmarkSerialWithConflict(b *testing.B) {
+	prefix := netip.MustParsePrefix("10.0.0.0/8")
+	a := &Allocator{
+		pools: []Pool{
+			{Prefix: prefix, Size: 24},
+		},
+		allocated: []netip.Prefix{},
+	}
+
+	reserved := []netip.Prefix{netip.PrefixFrom(prefix.Addr(), 24)}
+
+	// 5,000 -> 500ms
+	// 1,000 -> 17ms
+	//   500 -> 4ms
+	//    100 -> 246us
+	//     10 -> 20us
+	//      1 -> 15us
+	imax := 1
+	for i := 0; i < imax; i++ {
+		_, err := a.AllocateNext(reserved)
+		assert.NilError(b, err)
+
+		newReservedAddr := Add(reserved[len(reserved)-1].Addr(), 1, 8)
+		reserved = append(reserved, netip.PrefixFrom(newReservedAddr, 24))
+	}
 }

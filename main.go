@@ -49,24 +49,75 @@ func NewAllocator(pools []Pool) (*Allocator, error) {
 	}, nil
 }
 
-// AllocateNext iterate through its pools of prefixes and allocates the first
-// one is don't conflict with existing allocations. It returns either a new
-// prefix or ErrNoFreePool if there's free space.
-func (a *Allocator) AllocateNext() (netip.Prefix, error) {
-	var i, poolID int
-	var partialOverlap bool
+type DoubleCursor[T any] struct {
+	a      []T
+	b      []T
+	ia, ib int
+	cmp    func(a, b T) bool
+	lastA  bool
+}
 
-	for i < len(a.allocated) {
-		allocated := a.allocated[i]
+func NewDoubleCursor[T any](a, b []T, cmp func(a, b T) bool) *DoubleCursor[T] {
+	return &DoubleCursor[T]{
+		a:   a,
+		b:   b,
+		cmp: cmp,
+	}
+}
+
+func (dc *DoubleCursor[T]) Get() T {
+	if dc.ia < len(dc.a) && dc.ib < len(dc.b) {
+		if dc.cmp(dc.a[dc.ia], dc.b[dc.ib]) {
+			dc.lastA = true
+			return dc.a[dc.ia]
+		}
+		dc.lastA = false
+		return dc.b[dc.ib]
+	} else if dc.ia < len(dc.a) {
+		dc.lastA = true
+		return dc.a[dc.ia]
+	} else if dc.ib < len(dc.b) {
+		dc.lastA = false
+		return dc.b[dc.ib]
+	}
+
+	return *new(T)
+}
+
+func (dc *DoubleCursor[T]) Inc() {
+	if dc.lastA {
+		dc.ia++
+	} else {
+		dc.ib++
+	}
+}
+
+// AllocateNext iterate through its pools of prefixes and allocate the first
+// one that doesn't conflict with either existing allocations or 'reserved'. It
+// returns ErrNoFreePool if there's no free space. 'reserved' should be sorted.
+func (a *Allocator) AllocateNext(reserved []netip.Prefix) (netip.Prefix, error) {
+	var poolID int
+	var partialOverlap bool
+	var prevAlloc netip.Prefix
+
+	dc := NewDoubleCursor(a.allocated, reserved, func(a, b netip.Prefix) bool {
+		return a.Addr().Less(b.Addr())
+	})
+
+	for {
+		allocated := dc.Get()
+		if allocated == (netip.Prefix{}) {
+			break
+		}
 
 		if poolID >= len(a.pools) {
 			return netip.Prefix{}, ErrNoFreePool
 		}
-
 		p := a.pools[poolID]
 
 		if allocated.Overlaps(p.Prefix) {
-			i++
+			dc.Inc()
+			prevAlloc = allocated
 
 			if allocated.Bits() <= p.Prefix.Bits() {
 				// The current 'allocated' prefix is bigger than the pool, thus
@@ -79,7 +130,6 @@ func (a *Allocator) AllocateNext() (netip.Prefix, error) {
 			if lastAddr(allocated) == lastAddr(p.Prefix) {
 				// The last address of the current 'allocated' prefix is the
 				// same as the last address of the pool, it's fully overlapped.
-				// We can go to the next one.
 				partialOverlap = false
 				poolID++
 				continue
@@ -87,22 +137,19 @@ func (a *Allocator) AllocateNext() (netip.Prefix, error) {
 
 			// This pool is partially overlapped. If the next iteration yields
 			// an 'allocated' prefix that don't overlap with the current pool,
-			// then might have found the right spot.
+			// then we might have found the right spot.
 			partialOverlap = true
 			continue
 		}
 
 		// Okay, so previous 'allocated' overlapped and current doesn't. Now
 		// the question is: is there enough space left between previous
-		// 'allocated' and the end of p?
+		// 'allocated' and the end of 'p'?
 		if partialOverlap {
 			partialOverlap = false
 
-			// No need to check if 'i > 0' -- the lowest 'i' where 'partialOverlap'
-			// could be set is 1.
-			prevAlloc := a.allocated[i-1]
 			if next := nextPrefixAfter(prevAlloc, p); next != (netip.Prefix{}) {
-				a.allocated = slices.Insert(a.allocated, i, next)
+				a.allocated = slices.Insert(a.allocated, dc.ia, next)
 				return next, nil
 			}
 
@@ -110,20 +157,21 @@ func (a *Allocator) AllocateNext() (netip.Prefix, error) {
 			// not enough space left to use this pool.
 			poolID++
 
-			// We don't increment 'i' here, because we need to re-test the
-			// current 'allocated' against the next pool available.
+			// We don't increment 'dc' here, we need to re-test the current
+			// 'allocated' against the next pool available.
 			continue
 		}
 
-		// If the pool doesn't overlap and has a binary value lower than the
-		// current 'allocated', we found the right spot.
+		// If the pool doesn't overlap and is sorted before the current
+		// 'allocated', we found the right spot.
 		if p.Prefix.Addr().Less(allocated.Addr()) {
-			copy(a.allocated[i+1:], a.allocated[i:])
-			a.allocated[i] = netip.PrefixFrom(p.Prefix.Addr(), p.Size)
-			return a.allocated[i], nil
+			copy(a.allocated[dc.ia+1:], a.allocated[dc.ia:])
+			a.allocated[dc.ia] = netip.PrefixFrom(p.Prefix.Addr(), p.Size)
+			return a.allocated[dc.ia], nil
 		}
 
-		i++
+		dc.Inc()
+		prevAlloc = allocated
 	}
 
 	if poolID >= len(a.pools) {
@@ -136,10 +184,9 @@ func (a *Allocator) AllocateNext() (netip.Prefix, error) {
 	if partialOverlap {
 		p := a.pools[poolID]
 
-		prevAlloc := a.allocated[i-1]
-		if prefix := nextPrefixAfter(prevAlloc, p); prefix != (netip.Prefix{}) {
-			a.allocated = slices.Insert(a.allocated, i, prefix)
-			return prefix, nil
+		if next := nextPrefixAfter(prevAlloc, p); next != (netip.Prefix{}) {
+			a.allocated = slices.Insert(a.allocated, dc.ia, next)
+			return next, nil
 		}
 
 		// No luck -- next yielded an invalid prefix. There's not enough
@@ -147,19 +194,15 @@ func (a *Allocator) AllocateNext() (netip.Prefix, error) {
 		poolID++
 	}
 
-	// One last chance. Here we don't increment poolID since the last iteration
-	// on 'a.allocated' found either:
-	//
-	// - A full overlap, and incremented 'poolID'.
-	// - A partial overlap, and the previous 'if' incremented 'poolID'.
-	// - The current 'poolID' comes after the last 'allocated'.
-	//
-	// Hence, we're sure 'poolID' has never been subnetted yet.
+	// One last chance -- we didn't drain the pools yet. We'll try every
+	// possible prefix from each remaining pool and take the first prefix that
+	// doesn't overlap.
 	if poolID < len(a.pools) {
 		p := a.pools[poolID]
 
-		a.allocated = append(a.allocated, netip.PrefixFrom(p.Prefix.Addr(), p.Size))
-		return a.allocated[i], nil
+		next := netip.PrefixFrom(p.Prefix.Addr(), p.Size)
+		a.allocated = append(a.allocated, next)
+		return next, nil
 	}
 
 	return netip.Prefix{}, ErrNoFreePool
