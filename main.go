@@ -20,6 +20,11 @@ type Pool struct {
 	Size   int
 }
 
+// FirstSubnet returns the first subnet of the pool.
+func (p Pool) FirstSubnet() netip.Prefix {
+	return netip.PrefixFrom(p.Prefix.Addr(), p.Size)
+}
+
 func NewAllocator(pools []Pool) (*Allocator, error) {
 	for i, p := range pools {
 		if p.Prefix.IsValid() {
@@ -117,27 +122,50 @@ func (a *Allocator) AllocateNext(reserved []netip.Prefix) (netip.Prefix, error) 
 
 		if allocated.Overlaps(p.Prefix) {
 			dc.Inc()
-			prevAlloc = allocated
 
 			if allocated.Bits() <= p.Prefix.Bits() {
-				// The current 'allocated' prefix is bigger than the pool, thus
-				// the pool is fully overlapped.
+				// The current 'allocated' prefix is bigger than the pool. The
+				// pool is fully overlapped.
+				prevAlloc = netip.Prefix{}
 				partialOverlap = false
 				poolID++
 				continue
+			}
+
+			// If the pool isn't fully overlapped, and no previous 'allocated'
+			// was found to partially overlap 'p', we need to test whether
+			// there's enough space available at the beginning of 'p'.
+			if !partialOverlap && Distance(p.FirstSubnet(), allocated, p.Size) >= 1 {
+				// Okay, so there's at least a whole subnet available between
+				// the start of 'p' and 'allocated'.
+				next := p.FirstSubnet()
+				a.allocated = slices.Insert(a.allocated, dc.ia, next)
+				return next, nil
+			}
+
+			// If the pool 'p' was already found to be partially overlapped, we
+			// need to test whether there's enough space between 'prevAlloc'
+			// and current 'allocated'. That is, 2 subnets: one for 'prevAlloc'
+			// and one for the subnet we want to allocate.
+			if partialOverlap && Distance(prevAlloc, allocated, p.Size) >= 2 {
+				// Okay, so there's at least a whole subnet available after
+				// 'prevAlloc'.
+				next := nextPrefixAfter(prevAlloc, p)
+				a.allocated = slices.Insert(a.allocated, dc.ia, next)
+				return next, nil
 			}
 
 			if lastAddr(allocated) == lastAddr(p.Prefix) {
 				// The last address of the current 'allocated' prefix is the
 				// same as the last address of the pool, it's fully overlapped.
+				prevAlloc = netip.Prefix{}
 				partialOverlap = false
 				poolID++
 				continue
 			}
 
-			// This pool is partially overlapped. If the next iteration yields
-			// an 'allocated' prefix that don't overlap with the current pool,
-			// then we might have found the right spot.
+			// This pool is partially overlapped. We need to test the next 'allocated'.
+			prevAlloc = allocated
 			partialOverlap = true
 			continue
 		}
@@ -166,7 +194,7 @@ func (a *Allocator) AllocateNext(reserved []netip.Prefix) (netip.Prefix, error) 
 		// 'allocated', we found the right spot.
 		if p.Prefix.Addr().Less(allocated.Addr()) {
 			copy(a.allocated[dc.ia+1:], a.allocated[dc.ia:])
-			a.allocated[dc.ia] = netip.PrefixFrom(p.Prefix.Addr(), p.Size)
+			a.allocated[dc.ia] = p.FirstSubnet()
 			return a.allocated[dc.ia], nil
 		}
 
@@ -200,7 +228,7 @@ func (a *Allocator) AllocateNext(reserved []netip.Prefix) (netip.Prefix, error) 
 	if poolID < len(a.pools) {
 		p := a.pools[poolID]
 
-		next := netip.PrefixFrom(p.Prefix.Addr(), p.Size)
+		next := p.FirstSubnet()
 		a.allocated = append(a.allocated, next)
 		return next, nil
 	}
@@ -267,4 +295,21 @@ func Add(ip netip.Addr, x uint64, shift uint) netip.Addr {
 	addr += uint32(x) << shift
 	binary.BigEndian.PutUint32(a[:], addr)
 	return netip.AddrFrom4(a)
+}
+
+// Distance computes the number of subnets of size 'sz' available between 'p1'
+// and 'p2'.
+func Distance(p1 netip.Prefix, p2 netip.Prefix, sz int) uint32 {
+	p1 = netip.PrefixFrom(p1.Addr(), sz).Masked()
+	p2 = netip.PrefixFrom(p2.Addr(), sz).Masked()
+
+	return Substract(p2.Addr(), p1.Addr()) >> (p1.Addr().BitLen() - sz)
+}
+
+func Substract(ip1 netip.Addr, ip2 netip.Addr) uint32 {
+	a1 := ip1.As4()
+	a2 := ip2.As4()
+	addr1 := binary.BigEndian.Uint32(a1[:])
+	addr2 := binary.BigEndian.Uint32(a2[:])
+	return addr1 - addr2
 }

@@ -14,7 +14,48 @@ func TestAllocate(t *testing.T) {
 		expPrefix netip.Prefix
 		expErr    error
 	}{
-		"Partial overlap at the end of allocated, enough space": {
+		"First allocated overlaps at the end of first pool": {
+			allocator: &Allocator{
+				pools: []Pool{
+					{Prefix: netip.MustParsePrefix("192.168.0.0/16"), Size: 24},
+				},
+				allocated: []netip.Prefix{
+					// Partial overlap with enough space remaining
+					netip.MustParsePrefix("192.168.255.0/24"),
+				},
+			},
+			expPrefix: netip.MustParsePrefix("192.168.0.0/24"),
+		},
+		"First pool fully overlapped, next overlapped in the middle": {
+			allocator: &Allocator{
+				pools: []Pool{
+					{Prefix: netip.MustParsePrefix("10.20.0.0/16"), Size: 24},
+					{Prefix: netip.MustParsePrefix("192.168.0.0/16"), Size: 24},
+				},
+				allocated: []netip.Prefix{
+					netip.MustParsePrefix("10.0.0.0/8"),
+					// Partial overlap with enough space remaining
+					netip.MustParsePrefix("192.168.128.0/24"),
+				},
+			},
+			expPrefix: netip.MustParsePrefix("192.168.0.0/24"),
+		},
+		"First pool fully overlapped, next overlapped at the beginning and in the middle": {
+			allocator: &Allocator{
+				pools: []Pool{
+					{Prefix: netip.MustParsePrefix("10.20.0.0/16"), Size: 24},
+					{Prefix: netip.MustParsePrefix("192.168.0.0/16"), Size: 24},
+				},
+				allocated: []netip.Prefix{
+					netip.MustParsePrefix("10.0.0.0/8"),
+					// Partial overlap with enough space remaining
+					netip.MustParsePrefix("192.168.0.0/24"),
+					netip.MustParsePrefix("192.168.128.0/24"),
+				},
+			},
+			expPrefix: netip.MustParsePrefix("192.168.1.0/24"),
+		},
+		"Partial overlap at the end, enough space": {
 			allocator: &Allocator{
 				pools: []Pool{
 					{Prefix: netip.MustParsePrefix("192.168.0.0/16"), Size: 24},
